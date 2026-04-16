@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import zipfile
 from pathlib import Path
@@ -79,22 +80,42 @@ def get_status() -> dict[str, object]:
         endpoint=config.ollama_endpoint,
         api_key=config.ollama_api_key,
     )
+    safe_config = config.model_dump()
+    safe_config.pop("ollama_api_key", None)
     return _ok(
         index=idx,
         mode=runtime_mode(),
         checks=checks,
         diagnostics=vector_diagnostics(config.faiss_path, sample_size=10),
         ollama_active=check_ollama_status(config.ollama_endpoint, config.ollama_api_key),
-        config=config.model_dump(),
+        config=safe_config,
         python_runtime=python_runtime_status(),
     )
 
 
+def _validate_faiss_path(faiss_path: str) -> str:
+    """Validate faiss_path is a safe relative path within the project data directory."""
+    cleaned = faiss_path.strip()
+    if not cleaned:
+        raise ValueError("faiss_path cannot be empty.")
+    resolved = Path(cleaned).resolve()
+    project_root = Path(__file__).resolve().parent
+    if not str(resolved).startswith(str(project_root)):
+        raise ValueError("faiss_path must be within the project directory.")
+    return cleaned
+
+
 @app.post("/api/config")
 def update_config(req: ConfigUpdateRequest) -> dict[str, object]:
+    try:
+        _validate_faiss_path(req.faiss_path)
+    except ValueError as exc:
+        return _error(str(exc))
     updated = _config().model_copy(update=req.model_dump())
     save_config(updated)
-    return _ok(status="success", config=updated.model_dump())
+    safe_config = updated.model_dump()
+    safe_config.pop("ollama_api_key", None)
+    return _ok(status="success", config=safe_config)
 
 
 @app.post("/api/chat")
@@ -205,6 +226,38 @@ def batch_queries(req: BatchQueryRequest) -> dict[str, object]:
 
 
 @app.post("/api/index")
+def _safe_zip_extract(zip_path: Path, target_dir: str) -> None:
+    """Extract a ZIP file safely, rejecting entries that escape the target directory."""
+    target = Path(target_dir).resolve()
+    with zipfile.ZipFile(zip_path) as archive:
+        for entry in archive.namelist():
+            resolved = (target / entry).resolve()
+            if not str(resolved).startswith(str(target) + os.sep) and resolved != target:
+                raise ValueError(f"Zip entry escapes target directory: {entry}")
+        archive.extractall(target_dir)
+
+
+def _validate_folder_path(folder_path: str) -> Path:
+    """Validate a user-provided folder path to prevent path traversal."""
+    cleaned = folder_path.strip()
+    if not cleaned:
+        raise ValueError("Folder path cannot be empty.")
+    resolved = Path(cleaned).resolve()
+    # Block access to sensitive system directories
+    blocked_prefixes = ("/etc", "/proc", "/sys", "/dev", "/root", "/run")
+    for prefix in blocked_prefixes:
+        if str(resolved).startswith(prefix):
+            raise ValueError(f"Access to {prefix} is not allowed.")
+    # Block home-directory hidden files (e.g. ~/.ssh, ~/.gnupg)
+    home = Path.home().resolve()
+    if str(resolved).startswith(str(home)):
+        relative = resolved.relative_to(home)
+        parts = relative.parts
+        if parts and parts[0].startswith("."):
+            raise ValueError("Access to hidden directories in home is not allowed.")
+    return resolved
+
+
 async def build_index(folder_path: str | None = Form(default=None), files: list[UploadFile] | None = File(default=None)):
     config = _config()
     tmp_dir: tempfile.TemporaryDirectory[str] | None = None
@@ -216,17 +269,23 @@ async def build_index(folder_path: str | None = Form(default=None), files: list[
             for upload in files:
                 if not upload.filename:
                     continue
-                file_path = Path(tmp_dir.name) / upload.filename
+                # Sanitize uploaded filename to prevent path traversal
+                safe_name = Path(upload.filename).name
+                if not safe_name:
+                    continue
+                file_path = Path(tmp_dir.name) / safe_name
                 file_path.write_bytes(await upload.read())
                 if file_path.suffix.lower() == ".zip":
-                    with zipfile.ZipFile(file_path) as archive:
-                        archive.extractall(tmp_dir.name)
+                    _safe_zip_extract(file_path, tmp_dir.name)
             folder_to_index = tmp_dir.name
 
         if not folder_to_index:
             return _error("No folder path or files provided.")
 
-        folder = Path(folder_to_index).expanduser()
+        try:
+            folder = _validate_folder_path(folder_to_index)
+        except ValueError as exc:
+            return _error(str(exc))
         if not folder.exists():
             return _error(f"Folder not found: {folder}")
 
@@ -258,4 +317,4 @@ def get_vault_data() -> dict[str, object]:
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("api:app", host="127.0.0.1", port=8000, reload=False)
