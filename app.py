@@ -4,6 +4,7 @@ import argparse
 import csv
 import io
 import html
+import os
 import tempfile
 import zipfile
 from pathlib import Path
@@ -61,9 +62,19 @@ def _load_metadata_cached(metadata_path: str, mtime: float) -> list[dict[str, An
     return load_index_metadata(Path(metadata_path).parent)
 
 
+def _safe_zip_extract_streamlit(zf: zipfile.ZipFile, target_dir: str) -> None:
+    """Extract a ZIP file safely, rejecting entries that escape the target directory."""
+    target = Path(target_dir).resolve()
+    for entry in zf.namelist():
+        resolved = (target / entry).resolve()
+        if not str(resolved).startswith(str(target) + os.sep) and resolved != target:
+            raise ValueError(f"Zip entry escapes target directory: {entry}")
+    zf.extractall(target_dir)
+
+
 def _section_panel(title: str, subtitle: str) -> None:
     st.markdown(
-        f"<div class='panel'><span class='metric-head'>{title}</span><br/>{subtitle}</div>",
+        f"<div class='panel'><span class='metric-head'>{html.escape(title)}</span><br/>{html.escape(subtitle)}</div>",
         unsafe_allow_html=True,
     )
 
@@ -84,9 +95,9 @@ def _render_retrieval_card(title: str, score: float | None, meta: str, body: str
         (
             "<div class='retrieval-card'>"
             f"{score_html}"
-            f"<div><strong>{title}</strong></div>"
-            f"<div class='mono'>{meta}</div>"
-            f"<div style='margin-top:0.4rem;'>{body}</div>"
+            f"<div><strong>{html.escape(title)}</strong></div>"
+            f"<div class='mono'>{html.escape(meta)}</div>"
+            f"<div style='margin-top:0.4rem;'>{html.escape(body)}</div>"
             "</div>"
         ),
         unsafe_allow_html=True,
@@ -198,7 +209,7 @@ def render_sidebar(config: AppConfig) -> AppConfig:
                 if archive_zip is not None:
                     tmp_dir = tempfile.TemporaryDirectory(prefix="local_archive_zip_")
                     with zipfile.ZipFile(archive_zip) as zf:
-                        zf.extractall(tmp_dir.name)
+                        _safe_zip_extract_streamlit(zf, tmp_dir.name)
                     folder_to_index = tmp_dir.name
                 elif uploaded_pdfs:
                     tmp_dir = tempfile.TemporaryDirectory(prefix="local_archive_pdf_")
@@ -508,7 +519,7 @@ def render_chat(config: AppConfig) -> None:
     visible_history = st.session_state.chat_history[-max_messages:]
 
     for item in visible_history:
-        st.markdown(f"<div class='user-bubble'>{item['query']}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='user-bubble'>{html.escape(str(item['query']))}</div>", unsafe_allow_html=True)
         safe_answer = html.escape(str(item["answer"])).replace("\n", "<br/>")
         st.markdown(
             f"<div class='assistant-bubble'>{safe_answer}</div>",
@@ -670,9 +681,9 @@ def render_debug_logs(config: AppConfig) -> None:
                     (
                         "<div class='debug-chunk-card'>"
                         f"<div class='debug-score'>SIM: {float(item.get('score', 0)):.3f}</div>"
-                        f"<div class='chunk-title'>{str(item.get('file_name', 'unknown'))}</div>"
-                        f"<div class='chunk-meta mono'>CHUNK_ID: {item.get('chunk_index', 'N/A')}</div>"
-                        f"<div class='chunk-body'>\"...{str(item.get('text_preview', ''))}...\"</div>"
+                        f"<div class='chunk-title'>{html.escape(str(item.get('file_name', 'unknown')))}</div>"
+                        f"<div class='chunk-meta mono'>CHUNK_ID: {html.escape(str(item.get('chunk_index', 'N/A')))}</div>"
+                        f"<div class='chunk-body'>\"...{html.escape(str(item.get('text_preview', '')))}...\"</div>"
                         "</div>"
                     ),
                     unsafe_allow_html=True,
@@ -680,7 +691,7 @@ def render_debug_logs(config: AppConfig) -> None:
 
         st.markdown("<div class='prompt-head'>FULL PROMPT SENT TO LLM</div>", unsafe_allow_html=True)
         st.markdown(
-            f"<div class='prompt-panel mono'>{str(debug.get('prompt_text', ''))[:2000]}</div>",
+            f"<div class='prompt-panel mono'>{html.escape(str(debug.get('prompt_text', ''))[:2000])}</div>",
             unsafe_allow_html=True,
         )
 
