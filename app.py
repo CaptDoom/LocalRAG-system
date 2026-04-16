@@ -1054,21 +1054,23 @@ def render_vector_lab(config: AppConfig) -> None:
 _KEYBOARD_SHORTCUTS_JS = """
 <script>
 (function() {
-  if (window.__localArchiveShortcutsInstalled) return;
-  window.__localArchiveShortcutsInstalled = true;
+  // The component runs inside an iframe, so we attach listeners to the
+  // parent Streamlit document to capture keystrokes from the main page.
+  var parentDoc = window.parent.document;
+  if (parentDoc.__localArchiveShortcutsInstalled) return;
+  parentDoc.__localArchiveShortcutsInstalled = true;
 
-  document.addEventListener('keydown', function(e) {
+  parentDoc.addEventListener('keydown', function(e) {
     // Ctrl+K  – focus query textarea
     if (e.ctrlKey && !e.shiftKey && e.key === 'k') {
       e.preventDefault();
-      var ta = document.querySelector('textarea[aria-label="Enter query for local archive"]');
+      var ta = parentDoc.querySelector('textarea[aria-label="Enter query for local archive"]');
       if (ta) { ta.focus(); ta.select(); }
     }
     // Ctrl+Shift+C  – clear chat
     if (e.ctrlKey && e.shiftKey && e.key === 'C') {
       e.preventDefault();
-      // Find and click the CLEAR CHAT form-submit button
-      var buttons = document.querySelectorAll('button[kind="secondaryFormSubmit"], button');
+      var buttons = parentDoc.querySelectorAll('button[kind="secondaryFormSubmit"], button');
       for (var i = 0; i < buttons.length; i++) {
         if (buttons[i].textContent.trim() === 'CLEAR CHAT') {
           buttons[i].click();
