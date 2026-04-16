@@ -11,6 +11,7 @@ from tkinter import Tk, filedialog
 from typing import Any
 
 import streamlit as st
+import streamlit.components.v1 as components
 try:
     import plotly.graph_objects as go
 except Exception:  # pragma: no cover
@@ -55,10 +56,47 @@ st.set_page_config(
 st.markdown(CSS, unsafe_allow_html=True)
 
 
+# ---------------------------------------------------------------------------
+# Problem A: Cache heavy / repeated computations to avoid redundant work on
+#            every Streamlit rerun.  TTL ensures data stays reasonably fresh
+#            without hammering the underlying services on every click.
+# ---------------------------------------------------------------------------
+
 @st.cache_data(show_spinner=False)
 def _load_metadata_cached(metadata_path: str, mtime: float) -> list[dict[str, Any]]:
     del mtime
     return load_index_metadata(Path(metadata_path).parent)
+
+
+@st.cache_data(show_spinner=False, ttl=10)
+def _cached_index_status(faiss_path: str) -> dict[str, Any]:
+    """Cache index status for 10 s to avoid re-loading FAISS on every rerun."""
+    return get_index_status(faiss_path)
+
+
+@st.cache_data(show_spinner=False, ttl=15)
+def _cached_system_checks(
+    faiss_path: str, model_name: str, endpoint: str, api_key: str,
+) -> dict[str, Any]:
+    """Cache system checks for 15 s (Ollama ping, tesseract probe, etc.)."""
+    return system_checks(faiss_path, model_name, endpoint=endpoint, api_key=api_key)
+
+
+@st.cache_data(show_spinner=False, ttl=15)
+def _cached_runtime_mode() -> dict[str, str]:
+    """Cache GPU / runtime telemetry for 15 s."""
+    return runtime_mode()
+
+
+@st.cache_data(show_spinner=False, ttl=30)
+def _cached_vector_diagnostics(faiss_path: str, sample_size: int) -> dict[str, Any]:
+    """Cache PCA projection for 30 s – it only changes after re-indexing."""
+    return vector_diagnostics(faiss_path, sample_size=sample_size)
+
+
+@st.cache_data(show_spinner=False, ttl=8)
+def _cached_ollama_status(endpoint: str, api_key: str) -> bool:
+    return check_ollama_status(endpoint, api_key)
 
 
 def _section_panel(title: str, subtitle: str) -> None:
@@ -94,24 +132,23 @@ def _render_retrieval_card(title: str, score: float | None, meta: str, body: str
 
 
 def _init_state() -> None:
-    if "config" not in st.session_state:
+    defaults: dict[str, Any] = {
+        "config": None,
+        "chat_history": [],
+        "last_index_report": None,
+        "batch_results": [],
+        "last_debug_payload": {},
+        "selected_folder": "",
+        "nav_page": "LANDING",
+        "nav_pending": None,
+        "pipeline_stage": "Document Intake",
+    }
+    for key, default in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = default
+    # Load config once per session
+    if st.session_state.config is None:
         st.session_state.config = load_config()
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
-    if "last_index_report" not in st.session_state:
-        st.session_state.last_index_report = None
-    if "batch_results" not in st.session_state:
-        st.session_state.batch_results = []
-    if "last_debug_payload" not in st.session_state:
-        st.session_state.last_debug_payload = {}
-    if "selected_folder" not in st.session_state:
-        st.session_state.selected_folder = ""
-    if "nav_page" not in st.session_state:
-        st.session_state.nav_page = "LANDING"
-    if "nav_pending" not in st.session_state:
-        st.session_state.nav_pending = None
-    if "pipeline_stage" not in st.session_state:
-        st.session_state.pipeline_stage = "Document Intake"
 
 
 def _goto(page: str) -> None:
@@ -172,10 +209,9 @@ def render_sidebar(config: AppConfig) -> AppConfig:
             for ext, count in summary["top_extensions"].items():
                 st.sidebar.caption(f"- {ext}: {count}")
 
-    progress_slot = st.sidebar.empty()
-    file_slot = st.sidebar.empty()
-    chunk_slot = st.sidebar.empty()
-
+    # ------------------------------------------------------------------
+    # Problem B: Wrap indexing in st.status for rich progress feedback.
+    # ------------------------------------------------------------------
     if st.sidebar.button("INDEX_FILES", use_container_width=True):
         if (
             archive_zip is None
@@ -184,102 +220,125 @@ def render_sidebar(config: AppConfig) -> AppConfig:
         ):
             st.sidebar.error("Select a local folder, upload PDFs, or upload a ZIP archive.")
         else:
-            progress_slot.progress(0.0, text="Preparing indexing...")
+            with st.sidebar.status("Indexing documents...", expanded=True) as status:
+                progress_slot = st.sidebar.empty()
+                file_slot = st.sidebar.empty()
+                chunk_slot = st.sidebar.empty()
+                progress_slot.progress(0.0, text="Preparing indexing...")
 
-            def on_progress(update: dict) -> None:
-                pct = float(update.get("progress", 0.0))
-                progress_slot.progress(pct, text=f"Indexing... {int(pct * 100)}%")
-                file_slot.caption(f"Current file: {update.get('current_file', 'N/A')}")
-                chunk_slot.caption(f"Chunks indexed: {update.get('chunk_count', 0)}")
+                def on_progress(update: dict) -> None:
+                    pct = float(update.get("progress", 0.0))
+                    progress_slot.progress(pct, text=f"Indexing... {int(pct * 100)}%")
+                    file_slot.caption(f"Current file: {update.get('current_file', 'N/A')}")
+                    chunk_slot.caption(f"Chunks indexed: {update.get('chunk_count', 0)}")
 
-            try:
-                folder_to_index = st.session_state.selected_folder
-                tmp_dir: tempfile.TemporaryDirectory[str] | None = None
-                if archive_zip is not None:
-                    tmp_dir = tempfile.TemporaryDirectory(prefix="local_archive_zip_")
-                    with zipfile.ZipFile(archive_zip) as zf:
-                        zf.extractall(tmp_dir.name)
-                    folder_to_index = tmp_dir.name
-                elif uploaded_pdfs:
-                    tmp_dir = tempfile.TemporaryDirectory(prefix="local_archive_pdf_")
-                    for file in uploaded_pdfs:
-                        file_path = Path(tmp_dir.name) / file.name
-                        file_path.write_bytes(file.getbuffer())
-                    folder_to_index = tmp_dir.name
+                try:
+                    folder_to_index = st.session_state.selected_folder
+                    tmp_dir: tempfile.TemporaryDirectory[str] | None = None
+                    if archive_zip is not None:
+                        tmp_dir = tempfile.TemporaryDirectory(prefix="local_archive_zip_")
+                        with zipfile.ZipFile(archive_zip) as zf:
+                            zf.extractall(tmp_dir.name)
+                        folder_to_index = tmp_dir.name
+                    elif uploaded_pdfs:
+                        tmp_dir = tempfile.TemporaryDirectory(prefix="local_archive_pdf_")
+                        for file in uploaded_pdfs:
+                            file_path = Path(tmp_dir.name) / file.name
+                            file_path.write_bytes(file.getbuffer())
+                        folder_to_index = tmp_dir.name
 
-                report = index_documents(
-                    folder_path=folder_to_index,
-                    chunk_size=config.chunk_size,
-                    store_path=config.faiss_path,
-                    on_progress=on_progress,
-                )
-                st.session_state.last_index_report = report
-                st.sidebar.success(
-                    f"Index complete: {report.file_count} files / {report.chunk_count} chunks."
-                )
-            except Exception as exc:
-                st.sidebar.error(str(exc))
-            finally:
-                if "tmp_dir" in locals() and tmp_dir is not None:
-                    tmp_dir.cleanup()
+                    report = index_documents(
+                        folder_path=folder_to_index,
+                        chunk_size=config.chunk_size,
+                        store_path=config.faiss_path,
+                        on_progress=on_progress,
+                    )
+                    st.session_state.last_index_report = report
+                    # Bust caches after re-indexing so UI picks up new data.
+                    _cached_index_status.clear()
+                    _cached_vector_diagnostics.clear()
+                    status.update(label="Indexing complete", state="complete", expanded=False)
+                    st.sidebar.success(
+                        f"Index complete: {report.file_count} files / {report.chunk_count} chunks."
+                    )
+                except Exception as exc:
+                    status.update(label="Indexing failed", state="error", expanded=False)
+                    st.sidebar.error(str(exc))
+                finally:
+                    if "tmp_dir" in locals() and tmp_dir is not None:
+                        tmp_dir.cleanup()
 
     left, right = st.sidebar.columns(2)
     if left.button("CLEAR CHAT", use_container_width=True):
         st.session_state.chat_history = []
     if right.button("RE-INDEX", use_container_width=True):
+        _cached_index_status.clear()
+        _cached_vector_diagnostics.clear()
         st.rerun()
 
+    # ------------------------------------------------------------------
+    # Problem D: Wrap settings widgets in a form so they only apply when
+    #            the user explicitly clicks "Save settings".
+    # ------------------------------------------------------------------
     with st.sidebar.expander("Settings", expanded=False):
-        chunk_size = st.slider(
-            "Chunk size (tokens)",
-            min_value=500,
-            max_value=1000,
-            value=int(config.chunk_size),
-            step=50,
-        )
-        top_k = st.selectbox("Top-k", options=[2, 3, 4, 5, 6, 8], index=[2, 3, 4, 5, 6, 8].index(config.top_k) if config.top_k in [2, 3, 4, 5, 6, 8] else 2)
-        model_name = st.text_input("Model name", value=config.model_name)
-        ollama_endpoint = st.text_input("Ollama endpoint", value=config.ollama_endpoint)
-        faiss_path = st.text_input("FAISS path", value=config.faiss_path)
-        retrieval_mode = st.selectbox(
-            "Retrieval mode",
-            options=["vector", "hybrid", "hybrid+rerank"],
-            index=["vector", "hybrid", "hybrid+rerank"].index(config.retrieval_mode)
-            if config.retrieval_mode in {"vector", "hybrid", "hybrid+rerank"}
-            else 0,
-        )
-        ocr_engine = st.selectbox(
-            "OCR engine",
-            options=["tesseract", "easyocr"],
-            index=["tesseract", "easyocr"].index(config.ocr_engine)
-            if config.ocr_engine in {"tesseract", "easyocr"}
-            else 0,
-        )
-        bm25_weight = st.slider("BM25 weight", min_value=0.0, max_value=1.0, value=float(config.bm25_weight), step=0.05)
-        rerank_top_n = st.slider("Rerank top N", min_value=1, max_value=20, value=int(config.rerank_top_n), step=1)
-        debug_mode = st.checkbox("Debug mode", value=config.debug_mode)
-        if st.button("Save settings", use_container_width=True):
-            config = config.model_copy(update={
-                "chunk_size": int(chunk_size),
-                "top_k": int(top_k),
-                "model_name": model_name.strip() or config.model_name,
-                "ollama_endpoint": ollama_endpoint.strip() or config.ollama_endpoint,
-                "faiss_path": faiss_path.strip() or config.faiss_path,
-                "retrieval_mode": retrieval_mode,
-                "ocr_engine": ocr_engine,
-                "bm25_weight": float(bm25_weight),
-                "rerank_top_n": int(rerank_top_n),
-                "debug_mode": debug_mode,
-            })
-            save_config(config)
-            st.session_state.config = config
-            st.success("Settings saved to config.yaml")
+        with st.form("settings_form", border=False):
+            chunk_size = st.slider(
+                "Chunk size (tokens)",
+                min_value=500,
+                max_value=1000,
+                value=int(config.chunk_size),
+                step=50,
+            )
+            top_k = st.selectbox("Top-k", options=[2, 3, 4, 5, 6, 8], index=[2, 3, 4, 5, 6, 8].index(config.top_k) if config.top_k in [2, 3, 4, 5, 6, 8] else 2)
+            model_name = st.text_input("Model name", value=config.model_name)
+            ollama_endpoint = st.text_input("Ollama endpoint", value=config.ollama_endpoint)
+            faiss_path = st.text_input("FAISS path", value=config.faiss_path)
+            retrieval_mode = st.selectbox(
+                "Retrieval mode",
+                options=["vector", "hybrid", "hybrid+rerank"],
+                index=["vector", "hybrid", "hybrid+rerank"].index(config.retrieval_mode)
+                if config.retrieval_mode in {"vector", "hybrid", "hybrid+rerank"}
+                else 0,
+            )
+            ocr_engine = st.selectbox(
+                "OCR engine",
+                options=["tesseract", "easyocr"],
+                index=["tesseract", "easyocr"].index(config.ocr_engine)
+                if config.ocr_engine in {"tesseract", "easyocr"}
+                else 0,
+            )
+            bm25_weight = st.slider("BM25 weight", min_value=0.0, max_value=1.0, value=float(config.bm25_weight), step=0.05)
+            rerank_top_n = st.slider("Rerank top N", min_value=1, max_value=20, value=int(config.rerank_top_n), step=1)
+            debug_mode = st.checkbox("Debug mode", value=config.debug_mode)
+            if st.form_submit_button("Save settings", use_container_width=True):
+                config = config.model_copy(update={
+                    "chunk_size": int(chunk_size),
+                    "top_k": int(top_k),
+                    "model_name": model_name.strip() or config.model_name,
+                    "ollama_endpoint": ollama_endpoint.strip() or config.ollama_endpoint,
+                    "faiss_path": faiss_path.strip() or config.faiss_path,
+                    "retrieval_mode": retrieval_mode,
+                    "ocr_engine": ocr_engine,
+                    "bm25_weight": float(bm25_weight),
+                    "rerank_top_n": int(rerank_top_n),
+                    "debug_mode": debug_mode,
+                })
+                save_config(config)
+                st.session_state.config = config
+                # Bust caches that depend on config values.
+                _cached_index_status.clear()
+                _cached_system_checks.clear()
+                _cached_ollama_status.clear()
+                st.success("Settings saved to config.yaml")
 
+    # ------------------------------------------------------------------
+    # Problem A: Use cached versions of expensive system-vitals calls.
+    # ------------------------------------------------------------------
     st.sidebar.markdown("---")
     st.sidebar.markdown("### System Vitals")
-    mode = runtime_mode()
-    ollama_ok = check_ollama_status(config.ollama_endpoint, config.ollama_api_key)
-    idx = get_index_status(config.faiss_path)
+    mode = _cached_runtime_mode()
+    ollama_ok = _cached_ollama_status(config.ollama_endpoint, config.ollama_api_key)
+    idx = _cached_index_status(config.faiss_path)
 
     st.sidebar.caption(f"Mode: {mode['mode']}")
     st.sidebar.caption(f"VRAM: {mode['vram']}")
@@ -291,11 +350,11 @@ def render_sidebar(config: AppConfig) -> AppConfig:
     )
 
     with st.sidebar.expander("System Check", expanded=False):
-        checks = system_checks(
+        checks = _cached_system_checks(
             config.faiss_path,
             config.model_name,
-            endpoint=config.ollama_endpoint,
-            api_key=config.ollama_api_key,
+            config.ollama_endpoint,
+            config.ollama_api_key,
         )
         st.markdown(
             f"- Tesseract: {'OK' if checks['tesseract_installed'] else 'MISSING'}\n"
@@ -310,7 +369,7 @@ def render_sidebar(config: AppConfig) -> AppConfig:
 
 
 def render_status_card(config: AppConfig) -> dict[str, Any]:
-    idx = get_index_status(config.faiss_path)
+    idx = _cached_index_status(config.faiss_path)
     if idx["exists"]:
         st.markdown(
             (
@@ -340,14 +399,14 @@ def render_status_card(config: AppConfig) -> dict[str, Any]:
 
 
 def render_landing_page(config: AppConfig) -> None:
-    idx = get_index_status(config.faiss_path)
-    checks = system_checks(
+    idx = _cached_index_status(config.faiss_path)
+    checks = _cached_system_checks(
         config.faiss_path,
         config.model_name,
-        endpoint=config.ollama_endpoint,
-        api_key=config.ollama_api_key,
+        config.ollama_endpoint,
+        config.ollama_api_key,
     )
-    mode = runtime_mode()
+    mode = _cached_runtime_mode()
     st.markdown(
         (
             "<div class='landing-hero'>"
@@ -417,14 +476,14 @@ def render_landing_page(config: AppConfig) -> None:
 
 
 def render_pipeline_view(config: AppConfig) -> None:
-    idx = get_index_status(config.faiss_path)
-    checks = system_checks(
+    idx = _cached_index_status(config.faiss_path)
+    checks = _cached_system_checks(
         config.faiss_path,
         config.model_name,
-        endpoint=config.ollama_endpoint,
-        api_key=config.ollama_api_key,
+        config.ollama_endpoint,
+        config.ollama_api_key,
     )
-    diagnostics = vector_diagnostics(config.faiss_path, sample_size=300)
+    diagnostics = _cached_vector_diagnostics(config.faiss_path, sample_size=300)
     stages = [
         "Document Intake",
         "Parsing/Chunking",
@@ -533,11 +592,22 @@ def render_query_form(config: AppConfig) -> None:
     c2.metric("Top-K", int(config.top_k))
     c3.metric("Model", config.model_name)
 
+    # Problem E: Keyboard-shortcut hint next to the form.
+    st.markdown(
+        "<div style='margin-bottom:0.3rem;'>"
+        "<span class='kbd-hint'>Enter</span> submit "
+        "<span class='kbd-hint'>Ctrl+K</span> focus search "
+        "<span class='kbd-hint'>Ctrl+Shift+C</span> clear chat"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
     with st.form("query_form", clear_on_submit=True, border=False):
         query = st.text_area(
             "Enter query for local archive",
             height=84,
             placeholder="What are the key findings about compiler optimization?",
+            key="query_input",
         )
         c1, c2 = st.columns([2, 1])
         submitted = c1.form_submit_button("SEND  >", use_container_width=True)
@@ -551,7 +621,7 @@ def render_query_form(config: AppConfig) -> None:
         if not query.strip():
             st.warning("Please enter a query.")
             return
-        ollama_ok = check_ollama_status(config.ollama_endpoint, config.ollama_api_key)
+        ollama_ok = _cached_ollama_status(config.ollama_endpoint, config.ollama_api_key)
         if not ollama_ok:
             st.error(
                 f"Ollama is not running on {config.ollama_endpoint}. "
@@ -559,7 +629,19 @@ def render_query_form(config: AppConfig) -> None:
             )
             return
 
-        with st.spinner("Retrieving context and generating response..."):
+        # ------------------------------------------------------------------
+        # Problem B: Show a "thinking" animation while the LLM is working,
+        #            wrapped inside st.status for structured feedback.
+        # ------------------------------------------------------------------
+        with st.status("Processing your query...", expanded=True) as qstatus:
+            st.write("Retrieving context from local index...")
+            thinking_placeholder = st.empty()
+            thinking_placeholder.markdown(
+                "<div class='thinking-dots'>"
+                "<span></span><span></span><span></span>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
             try:
                 payload = answer_query(
                     query=query.strip(),
@@ -573,6 +655,7 @@ def render_query_form(config: AppConfig) -> None:
                     bm25_weight=config.bm25_weight,
                     rerank_top_n=config.rerank_top_n,
                 )
+                thinking_placeholder.empty()
                 st.session_state.chat_history.append(
                     {
                         "query": query.strip(),
@@ -582,7 +665,10 @@ def render_query_form(config: AppConfig) -> None:
                     }
                 )
                 st.session_state.last_debug_payload = payload.get("debug_payload", {})
+                qstatus.update(label="Response ready", state="complete", expanded=False)
             except Exception as exc:
+                thinking_placeholder.empty()
+                qstatus.update(label="Query failed", state="error", expanded=False)
                 st.error(str(exc))
 
 
@@ -623,7 +709,7 @@ def render_debug_logs(config: AppConfig) -> None:
             ],
             "prompt_text": "[SYSTEM]\nYou are a highly specialized AI assistant focused on technical document retrieval.",
         }
-    diagnostics = vector_diagnostics(config.faiss_path, sample_size=300)
+    diagnostics = _cached_vector_diagnostics(config.faiss_path, sample_size=300)
     overview_tab, vault_tab, vector_tab = st.tabs(["Trace Overview", "Vault", "Vector Lab"])
 
     with overview_tab:
@@ -692,8 +778,10 @@ def render_debug_logs(config: AppConfig) -> None:
 
 
 def _run_batch_query(queries: list[str], config: AppConfig) -> None:
+    """Execute batch queries with per-item st.progress updates (Problem B)."""
     st.session_state.batch_results = []
     progress = st.progress(0.0, text="Queue initialized")
+    results_slot = st.empty()  # Problem CC: incremental results display
 
     for idx, query in enumerate(queries, start=1):
         row: dict[str, Any] = {
@@ -726,7 +814,14 @@ def _run_batch_query(queries: list[str], config: AppConfig) -> None:
             row["status"] = "FAILED"
             row["progress"] = 100
 
-        progress.progress(idx / len(queries), text=f"Processed {idx}/{len(queries)} queries")
+        pct = idx / len(queries)
+        progress.progress(pct, text=f"Processed {idx}/{len(queries)} queries")
+        # Show incremental results as each query completes.
+        results_slot.dataframe(
+            [{"id": r["id"], "status": r["status"], "query": r["query"][:60]} for r in st.session_state.batch_results],
+            use_container_width=True,
+            hide_index=True,
+        )
 
 
 def render_batch_queue(config: AppConfig) -> None:
@@ -827,9 +922,15 @@ def render_vault_view(config: AppConfig) -> None:
         st.info("Indexed metadata is empty.")
         return
 
-    left, right = st.columns([2, 1])
-    selected = left.selectbox("Select indexed document", options=files)
-    search = right.text_input("Search within", value="")
+    # ------------------------------------------------------------------
+    # Problem D: Wrap the vault search filter in a form so typing in the
+    #            search box no longer triggers a rerun on every keystroke.
+    # ------------------------------------------------------------------
+    with st.form("vault_filter_form", border=False):
+        left, right = st.columns([2, 1])
+        selected = left.selectbox("Select indexed document", options=files)
+        search = right.text_input("Search within", value="")
+        st.form_submit_button("Apply filter", use_container_width=True)
 
     filtered = [m for m in metadata if m.get("file_name") == selected]
     if search.strip():
@@ -861,7 +962,7 @@ def render_vector_lab(config: AppConfig) -> None:
         "Visualize embedding distribution, vector DB shape, and local retrieval traces.",
     )
     sample_size = st.slider("Vector sample size", min_value=100, max_value=1500, value=500, step=100)
-    diagnostics = vector_diagnostics(config.faiss_path, sample_size=sample_size)
+    diagnostics = _cached_vector_diagnostics(config.faiss_path, sample_size=sample_size)
     if not diagnostics.get("ready"):
         st.info(diagnostics.get("message", "No vector diagnostics available."))
         return
@@ -944,6 +1045,45 @@ def render_vector_lab(config: AppConfig) -> None:
         st.code(debug.get("prompt_text", ""), language="text")
 
 
+# ---------------------------------------------------------------------------
+# Problem E: Keyboard shortcuts injected once via a hidden HTML component.
+#   - Ctrl+K  → focus the query text-area
+#   - Ctrl+Shift+C  → clear chat (sets a session_state flag and reruns)
+#   Enter already submits the form natively in Streamlit.
+# ---------------------------------------------------------------------------
+_KEYBOARD_SHORTCUTS_JS = """
+<script>
+(function() {
+  // The component runs inside an iframe, so we attach listeners to the
+  // parent Streamlit document to capture keystrokes from the main page.
+  var parentDoc = window.parent.document;
+  if (parentDoc.__localArchiveShortcutsInstalled) return;
+  parentDoc.__localArchiveShortcutsInstalled = true;
+
+  parentDoc.addEventListener('keydown', function(e) {
+    // Ctrl+K  – focus query textarea
+    if (e.ctrlKey && !e.shiftKey && e.key === 'k') {
+      e.preventDefault();
+      var ta = parentDoc.querySelector('textarea[aria-label="Enter query for local archive"]');
+      if (ta) { ta.focus(); ta.select(); }
+    }
+    // Ctrl+Shift+C  – clear chat
+    if (e.ctrlKey && e.shiftKey && e.key === 'C') {
+      e.preventDefault();
+      var buttons = parentDoc.querySelectorAll('button[kind="secondaryFormSubmit"], button');
+      for (var i = 0; i < buttons.length; i++) {
+        if (buttons[i].textContent.trim() === 'CLEAR CHAT') {
+          buttons[i].click();
+          break;
+        }
+      }
+    }
+  });
+})();
+</script>
+"""
+
+
 def main() -> None:
     _init_state()
     config = st.session_state.config
@@ -1002,6 +1142,9 @@ def main() -> None:
 
     st.caption(f"Config file: {Path('config.yaml').resolve()}")
     st.markdown("</div>", unsafe_allow_html=True)
+
+    # Problem E: Inject keyboard shortcuts once at the bottom of the page.
+    components.html(_KEYBOARD_SHORTCUTS_JS, height=0, width=0)
 
 
 if __name__ == "__main__":
