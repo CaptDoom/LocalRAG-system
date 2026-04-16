@@ -567,6 +567,66 @@ div[data-testid="stAlert"] {
   }
 }
 
+/* Thinking / typing animation for LLM generation */
+.thinking-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0.6rem 0;
+}
+
+.thinking-dots span {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: dotPulse 1.4s infinite ease-in-out both;
+}
+
+.thinking-dots span:nth-child(1) { animation-delay: -0.32s; }
+.thinking-dots span:nth-child(2) { animation-delay: -0.16s; }
+.thinking-dots span:nth-child(3) { animation-delay: 0s; }
+
+@keyframes dotPulse {
+  0%, 80%, 100% { transform: scale(0.4); opacity: 0.4; }
+  40% { transform: scale(1); opacity: 1; }
+}
+
+/* Keyboard shortcut hints */
+.kbd-hint {
+  display: inline-block;
+  background: var(--surface-high);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0.08rem 0.35rem;
+  font-size: 0.65rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  color: var(--muted);
+  font-weight: 700;
+  margin-left: 0.3rem;
+  vertical-align: middle;
+}
+
+/* Skeleton loading placeholder */
+.skeleton-block {
+  background: linear-gradient(90deg, var(--surface-high) 25%, #e8edf5 50%, var(--surface-high) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+  border-radius: 8px;
+  height: 1.2rem;
+  margin-bottom: 0.5rem;
+}
+
+.skeleton-block.wide { width: 80%; }
+.skeleton-block.medium { width: 55%; }
+.skeleton-block.narrow { width: 35%; }
+.skeleton-block.tall { height: 3rem; }
+
+@keyframes shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
 @keyframes fadeIn {
   from { opacity: 0; transform: translateY(4px); }
   to { opacity: 1; transform: translateY(0); }
