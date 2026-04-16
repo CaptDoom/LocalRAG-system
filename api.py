@@ -225,7 +225,6 @@ def batch_queries(req: BatchQueryRequest) -> dict[str, object]:
     )
 
 
-@app.post("/api/index")
 def _safe_zip_extract(zip_path: Path, target_dir: str) -> None:
     """Extract a ZIP file safely, rejecting entries that escape the target directory."""
     target = Path(target_dir).resolve()
@@ -258,6 +257,7 @@ def _validate_folder_path(folder_path: str) -> Path:
     return resolved
 
 
+@app.post("/api/index")
 async def build_index(folder_path: str | None = Form(default=None), files: list[UploadFile] | None = File(default=None)):
     config = _config()
     tmp_dir: tempfile.TemporaryDirectory[str] | None = None
